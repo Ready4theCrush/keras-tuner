@@ -16,6 +16,7 @@ import collections
 import os
 import pickle
 import warnings
+import inspect
 
 import numpy as np
 import tensorflow as tf
@@ -161,39 +162,64 @@ class SklearnTuner(base_tuner.BaseTuner):
             X_test = split_data(X, test_indices)
             y_test = split_data(y, test_indices)
 
-            sample_weight_train = (
-                sample_weight[train_indices] if sample_weight is not None else None
-            )
+            # keras-tuner uses a (n,1) shape for y, but sklearn models
+            # expect an (n,) shape. So we convert the shape of y.
+            y_train = np.squeeze(y_train)
+            y_test = np.squeeze(y_test)
 
             model = self.hypermodel.build(trial.hyperparameters)
-            if isinstance(model, sklearn.pipeline.Pipeline):
-                model.fit(X_train, y_train)
-            else:
-                model.fit(X_train, y_train, sample_weight=sample_weight_train)
 
-            sample_weight_test = (
-                sample_weight[test_indices] if sample_weight is not None else None
-            )
+            # Check to see if the model will accept sample_weight as an arg
+            argspec = inspect.getfullargspec(model.fit)
+            sample_weight_arg_expected = 'sample_weight' in inspect.getfullargspec(model.fit)[0]
 
-            if self.scoring is None:
-                score = model.score(X_test, y_test, sample_weight=sample_weight_test)
-            else:
-                score = self.scoring(
-                    model, X_test, y_test, sample_weight=sample_weight_test
+            # Fit
+            if sample_weight_arg_expected:
+                sample_weight_train = (
+                    sample_weight[train_indices] if sample_weight is not None else None
                 )
+                sample_weight_test = (
+                    sample_weight[test_indices] if sample_weight is not None else None
+                )
+                model.fit(X_train, y_train, sample_weight=sample_weight_train)
+            else:
+                model.fit(X_train, y_train)
+
+            # Score
+            if sample_weight_arg_expected:
+                if self.scoring is None:
+                    score = model.score(X_test, y_test, sample_weight=sample_weight_test)
+                else:
+                    score = self.scoring(
+                        model, X_test, y_test, sample_weight=sample_weight_test
+                    )
+            else:
+                if self.scoring is None:
+                    score = model.score(X_test, y_test)
+                else:
+                    score = self.scoring(
+                        model, X_test, y_test
+                    )
+
             metrics["score"].append(score)
 
+            # Metrics
             if self.metrics:
                 y_test_pred = model.predict(X_test)
                 for metric in self.metrics:
-                    result = metric(
-                        y_test, y_test_pred, sample_weight=sample_weight_test
-                    )
+                    if sample_weight_arg_expected:
+                        result = metric(
+                            y_test, y_test_pred, sample_weight=sample_weight_test
+                        )
+                    else:
+                        result = metric(
+                            y_test, y_test_pred
+                        )                    
                     metrics[metric.__name__].append(result)
 
         trial_metrics = {name: np.mean(values) for name, values in metrics.items()}
         self.oracle.update_trial(trial.trial_id, trial_metrics)
-        self.save_model(trial.trial_id, model)
+        self.save_model(trial.trial_id, model)        
 
     def save_model(self, trial_id, model, step=0):
         fname = os.path.join(self.get_trial_dir(trial_id), "model.pickle")
